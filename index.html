@@ -1,0 +1,221 @@
+"""Flask front end: ownership verification, rate limiting, scan endpoint."""
+import os
+import secrets
+import socket
+import time
+from collections import defaultdict, deque
+from urllib.parse import urlparse
+
+import dns.resolver
+import requests
+from flask import Flask, Response, jsonify, request, session
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+import scanner
+
+INDEX_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passive Site Scanner</title>
+<style>
+  :root { --bg:#0f1419; --card:#18202a; --text:#e6edf3; --muted:#8b98a5; --accent:#3b82f6;
+          --high:#ef4444; --medium:#f59e0b; --low:#eab308; --info:#64748b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin-top:0; }
+  .card { background:var(--card); border-radius:10px; padding:16px; margin:16px 0; }
+  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid #2b3643;
+          background:#0f1419; color:var(--text); font-size:1rem; }
+  button { margin-top:10px; padding:10px 16px; border:0; border-radius:8px; background:var(--accent);
+           color:#fff; font-size:1rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  code, pre { background:#0f1419; padding:2px 6px; border-radius:4px; word-break:break-all; }
+  pre { padding:10px; white-space:pre-wrap; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:.75rem; color:#fff; text-transform:uppercase; }
+  .high{background:var(--high)} .medium{background:var(--medium)} .low{background:var(--low);color:#222} .info{background:var(--info)}
+  .finding { border-left:3px solid var(--info); padding:6px 12px; margin:10px 0; }
+  .finding.high{border-color:var(--high)} .finding.medium{border-color:var(--medium)} .finding.low{border-color:var(--low)}
+  .fix { color:var(--muted); font-size:.9rem; }
+  .err { color:#fca5a5; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Passive Site Scanner</h1>
+  <p class="sub">Checks headers, TLS, cookies and exposed files. Only scan sites you own: ownership is verified first.</p>
+
+  <div class="card">
+    <label for="url">Website URL</label>
+    <input id="url" placeholder="example.com" autocomplete="off">
+    <button id="challengeBtn">1. Get verification steps</button>
+  </div>
+
+  <div id="verify" class="card hidden">
+    <strong>Prove you own <span id="vhost"></span></strong>
+    <p>Do <em>one</em> of these:</p>
+    <p>A. Add this DNS record:</p><pre id="dns"></pre>
+    <p>B. Or serve a file at <code id="fpath"></code> containing:</p><pre id="fcontent"></pre>
+    <button id="scanBtn">2. Verify and scan</button>
+  </div>
+
+  <div id="msg" class="err"></div>
+  <div id="results"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return {ok:r.ok, data: await r.json()};
+}
+
+$('challengeBtn').onclick = async () => {
+  $('msg').textContent = '';
+  const {ok, data} = await post('/api/challenge', {url:$('url').value});
+  if (!ok) { $('msg').textContent = data.error; return; }
+  $('vhost').textContent = data.host;
+  $('dns').textContent = data.dns_record;
+  $('fpath').textContent = data.file_path;
+  $('fcontent').textContent = data.file_content;
+  $('verify').classList.remove('hidden');
+};
+
+$('scanBtn').onclick = async () => {
+  const btn = $('scanBtn'); btn.disabled = true; $('msg').textContent = ''; $('results').innerHTML = '';
+  const {ok, data} = await post('/api/scan', {url:$('url').value});
+  btn.disabled = false;
+  if (!ok) { $('msg').textContent = data.error; return; }
+  const c = data.counts;
+  let html = `<div class="card"><strong>${esc(data.final_url)}</strong> (HTTP ${data.status})<br>
+    ${['high','medium','low','info'].map(s => `<span class="badge ${s}">${s} ${c[s]}</span>`).join(' ')}</div>`;
+  for (const f of data.findings) {
+    html += `<div class="finding ${f.severity}"><span class="badge ${f.severity}">${f.severity}</span>
+      <strong>${esc(f.title)}</strong><br>${esc(f.detail)}
+      ${f.fix ? `<div class="fix">Fix: ${esc(f.fix)}</div>` : ''}</div>`;
+  }
+  $('results').innerHTML = html;
+};
+</script>
+</body>
+</html>
+'''
+
+app = Flask(__name__)
+# Behind Render's proxy: trust one hop so request.remote_addr is the real client IP.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+    MAX_CONTENT_LENGTH=4 * 1024,
+)
+
+RATE_LIMIT = 5          # requests
+RATE_WINDOW = 60        # seconds
+_hits = defaultdict(deque)
+
+
+def rate_limited(key: str) -> bool:
+    now = time.time()
+    q = _hits[key]
+    while q and now - q[0] > RATE_WINDOW:
+        q.popleft()
+    if len(q) >= RATE_LIMIT:
+        return True
+    q.append(now)
+    return False
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def host_of(url: str) -> str:
+    u = urlparse(url if "://" in url else "https://" + url)
+    return (u.hostname or "").lower()
+
+
+def check_ownership(url: str, token: str):
+    """Return (ok, message). Accept a DNS TXT record or a token file."""
+    host = host_of(url)
+    expected = f"vulnscan-verify={token}"
+    try:
+        for rdata in dns.resolver.resolve(f"_vulnscan.{host}", "TXT", lifetime=5):
+            if expected in b"".join(rdata.strings).decode(errors="ignore"):
+                return True, "DNS TXT record found."
+    except Exception:
+        pass
+    for scheme in ("https", "http"):
+        try:
+            r, _ = scanner.safe_get(f"{scheme}://{host}/.well-known/vulnscan-{token}.txt")
+            if r.status_code == 200 and token in r.content.decode(errors="ignore"):
+                return True, "Verification file found."
+        except Exception:
+            continue
+    return False, "Verification not found yet."
+
+
+@app.get("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.post("/api/challenge")
+def challenge():
+    data = request.get_json(silent=True) or {}
+    host = host_of(data.get("url", ""))
+    if not host:
+        return jsonify(error="Enter a valid URL."), 400
+    tokens = session.setdefault("tokens", {})
+    token = tokens.get(host) or secrets.token_urlsafe(16)
+    tokens[host] = token
+    session.modified = True
+    return jsonify(host=host, token=token,
+                   dns_record=f"_vulnscan.{host}  TXT  \"vulnscan-verify={token}\"",
+                   file_path=f"/.well-known/vulnscan-{token}.txt",
+                   file_content=token)
+
+
+@app.post("/api/scan")
+def scan_endpoint():
+    ip = request.remote_addr or "unknown"
+    if rate_limited(ip):
+        return jsonify(error="Too many requests. Try again in a minute."), 429
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if "://" not in url:
+        url = "https://" + url
+    host = host_of(url)
+    token = session.get("tokens", {}).get(host)
+    if not token:
+        return jsonify(error="Request a verification challenge for this site first."), 400
+    ok, msg = check_ownership(url, token)
+    if not ok:
+        return jsonify(error=f"Ownership not verified. {msg}"), 403
+    try:
+        return jsonify(scanner.scan(url))
+    except scanner.UnsafeTarget as e:
+        return jsonify(error=str(e)), 400
+    except requests.RequestException as e:
+        return jsonify(error=f"Could not reach the site: {type(e).__name__}"), 502
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    app.run(host=host, port=port, debug=False)
