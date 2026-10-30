@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passive Site Scanner</title>
+<style>
+  :root { --bg:#0f1419; --card:#18202a; --text:#e6edf3; --muted:#8b98a5; --accent:#3b82f6;
+          --high:#ef4444; --medium:#f59e0b; --low:#eab308; --info:#64748b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin-top:0; }
+  .card { background:var(--card); border-radius:10px; padding:16px; margin:16px 0; }
+  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid #2b3643;
+          background:#0f1419; color:var(--text); font-size:1rem; }
+  button { margin-top:10px; padding:10px 16px; border:0; border-radius:8px; background:var(--accent);
+           color:#fff; font-size:1rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  code, pre { background:#0f1419; padding:2px 6px; border-radius:4px; word-break:break-all; }
+  pre { padding:10px; white-space:pre-wrap; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:.75rem; color:#fff; text-transform:uppercase; }
+  .high{background:var(--high)} .medium{background:var(--medium)} .low{background:var(--low);color:#222} .info{background:var(--info)}
+  .finding { border-left:3px solid var(--info); padding:6px 12px; margin:10px 0; }
+  .finding.high{border-color:var(--high)} .finding.medium{border-color:var(--medium)} .finding.low{border-color:var(--low)}
+  .fix { color:var(--muted); font-size:.9rem; }
+  .err { color:#fca5a5; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Passive Site Scanner</h1>
+  <p class="sub">Checks headers, TLS, cookies and exposed files. Only scan sites you own: ownership is verified first.</p>
+
+  <div class="card">
+    <label for="url">Website URL</label>
+    <input id="url" placeholder="example.com" autocomplete="off">
+    <button id="challengeBtn">1. Get verification steps</button>
+  </div>
+
+  <div id="verify" class="card hidden">
+    <strong>Prove you own <span id="vhost"></span></strong>
+    <p>Do <em>one</em> of these:</p>
+    <p>A. Add this DNS record:</p><pre id="dns"></pre>
+    <p>B. Or serve a file at <code id="fpath"></code> containing:</p><pre id="fcontent"></pre>
+    <button id="scanBtn">2. Verify and scan</button>
+  </div>
+
+  <div id="msg" class="err"></div>
+  <div id="results"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return {ok:r.ok, data: await r.json()};
+}
+
+$('challengeBtn').onclick = async () => {
+  $('msg').textContent = '';
+  const {ok, data} = await post('/api/challenge', {url:$('url').value});
+  if (!ok) { $('msg').textContent = data.error; return; }
+  $('vhost').textContent = data.host;
+  $('dns').textContent = data.dns_record;
+  $('fpath').textContent = data.file_path;
+  $('fcontent').textContent = data.file_content;
+  $('verify').classList.remove('hidden');
+};
+
+$('scanBtn').onclick = async () => {
+  const btn = $('scanBtn'); btn.disabled = true; $('msg').textContent = ''; $('results').innerHTML = '';
+  const {ok, data} = await post('/api/scan', {url:$('url').value});
+  btn.disabled = false;
+  if (!ok) { $('msg').textContent = data.error; return; }
+  const c = data.counts;
+  let html = `<div class="card"><strong>${esc(data.final_url)}</strong> (HTTP ${data.status})<br>
+    ${['high','medium','low','info'].map(s => `<span class="badge ${s}">${s} ${c[s]}</span>`).join(' ')}</div>`;
+  for (const f of data.findings) {
+    html += `<div class="finding ${f.severity}"><span class="badge ${f.severity}">${f.severity}</span>
+      <strong>${esc(f.title)}</strong><br>${esc(f.detail)}
+      ${f.fix ? `<div class="fix">Fix: ${esc(f.fix)}</div>` : ''}</div>`;
+  }
+  $('results').innerHTML = html;
+};
+</script>
+</body>
+</html>

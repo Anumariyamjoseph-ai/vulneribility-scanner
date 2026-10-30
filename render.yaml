@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: passive-site-scanner
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # One worker with threads keeps the in-memory rate limit accurate.
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 60
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: PYTHON_VERSION
+        value: 3.12.3
